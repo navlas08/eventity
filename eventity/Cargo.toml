@@ -1,0 +1,33 @@
+[package]
+name = "eventity"
+version = "0.1.0"
+edition = "2024"
+description = "Rust-like MediatR or Wolverine.NET PostgreSQL, RabbitMQ and transactional outbox/inbox pattern"
+license = "MIT"
+license-file = "LICENSE"
+repository = "https://github.com/navlas08/eventity"
+readme = "README.md"
+keywords = ["events", "rabbitmq", "postgres", "outbox", "async"]
+categories = ["asynchronous", "database"]
+
+[dependencies]
+eventity_macro = { version = "0.1.0", path = "../eventity_macro" }
+lapin = "4.12.0"
+async-trait = "0.1.92"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["macros", "sync", "time"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
+uuid = { version = "1.26.1", features = ["v7"] }
+futures-lite = "2.6.1"
+
+thiserror = "2.0.21"
+tracing = "0.1.44"
+sqlx = { version = "0.9.0", features = [
+    "runtime-tokio",
+    "postgres",
+    "macros",
+    "uuid",
+    "chrono",
+    "json"
+] }
