@@ -500,13 +500,43 @@ where
     H: EventHandler<E>,
 {
     let mut tasks = JoinSet::new();
+    let concurrency = Arc::new(tokio::sync::Semaphore::new(limit));
+    // A semaphore token is consumed for each delivery and replenished once per
+    // second. This caps starts at `limit` per second without blocking the
+    // consumer on the number of JoinSet entries.
+    const MAX_MESSAGES_PER_SECOND: usize = 160;
+    let rate = Arc::new(tokio::sync::Semaphore::new(MAX_MESSAGES_PER_SECOND));
+    let mut rate_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    rate_interval.tick().await;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
+            _ = rate_interval.tick() => {
+                // Discard unused tokens so idle time cannot accumulate into a
+                // burst larger than the per-second limit.
+                let available = rate.available_permits();
+                if available > 0 {
+                    if let Ok(permit) = rate.clone().try_acquire_many_owned(available as u32) {
+                        permit.forget();
+                    }
+                }
+                rate.add_permits(MAX_MESSAGES_PER_SECOND);
+            }
             delivery = consumer.next() => match delivery {
                 Some(Ok(delivery)) => {
-                    let (store, handler) = (store.clone(), handler.clone());
+                    let (store, handler, cancel, rate, concurrency) =
+                        (store.clone(), handler.clone(), cancel.clone(), rate.clone(), concurrency.clone());
                     tasks.spawn(async move {
+                        let rate_permit = tokio::select! {
+                            _ = cancel.cancelled() => return Ok(()),
+                            permit = rate.acquire_owned() => permit.map_err(|_| EventityError::Worker("rate limiter closed".into()))?,
+                        };
+                        rate_permit.forget();
+                        let concurrency_permit = tokio::select! {
+                            _ = cancel.cancelled() => return Ok(()),
+                            permit = concurrency.acquire_owned() => permit.map_err(|_| EventityError::Worker("concurrency limiter closed".into()))?,
+                        };
+                        let _concurrency_permit = concurrency_permit;
                         match process_delivery::<E, H>(&store, &handler, &delivery).await {
                             Ok(()) => delivery.ack(BasicAckOptions::default()).await.map(|_| ()).map_err(EventityError::from),
                             Err(error) => {
@@ -516,11 +546,6 @@ where
                             }
                         }
                     });
-                    while tasks.len() >= limit {
-                        if let Some(result) = tasks.join_next().await {
-                            result.map_err(|error| EventityError::Join(error.to_string()))??;
-                        }
-                    }
                 }
                 Some(Err(error)) => match channel.wait_for_recovery(error).await {
                     Ok(()) => continue,
