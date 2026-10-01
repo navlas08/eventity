@@ -1,6 +1,6 @@
 [package]
 name = "eventity"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "Rust-like MediatR or Wolverine.NET PostgreSQL, RabbitMQ and transactional outbox/inbox pattern"
 license = "MIT"
