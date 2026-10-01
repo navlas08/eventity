@@ -1,4 +1,3 @@
-use crate::bus::Message;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use lapin::types::ShortString;
 use serde_json::Value;
@@ -25,6 +24,16 @@ fn restore_outbox_payload(payload: Value) -> Value {
     serde_json::from_slice(&bytes).unwrap_or(Value::Array(values))
 }
 
+// PostgreSQL already stores valid JSON. Forward its text representation without
+// building and serializing a JSON DOM. Only legacy byte-array payloads need repair.
+fn encoded_outbox_payload(payload: &str) -> Result<std::borrow::Cow<'_, [u8]>, serde_json::Error> {
+    if payload.trim_start().starts_with('[') {
+        let value = restore_outbox_payload(serde_json::from_str(payload)?);
+        return serde_json::to_vec(&value).map(std::borrow::Cow::Owned);
+    }
+    Ok(std::borrow::Cow::Borrowed(payload.as_bytes()))
+}
+
 pub(crate) struct OutboxRecord {
     pub event_id: uuid::Uuid,
     pub aggregate_type: String,
@@ -47,7 +56,7 @@ struct PendingOutboxRecord {
     id: i64,
     event_id: uuid::Uuid,
     exchange: String,
-    payload: Value,
+    payload: String,
     attempt_count: i32,
 }
 
@@ -77,6 +86,7 @@ pub struct EventityPg {
     pool: PgPool,
     outbox_options: OutboxOptions,
     outbox_ready: tokio::sync::Notify,
+    outbox_concurrency: NonZeroU16,
 }
 
 impl EventityPg {
@@ -86,6 +96,7 @@ impl EventityPg {
             pool,
             outbox_options: OutboxOptions::default(),
             outbox_ready: tokio::sync::Notify::new(),
+            outbox_concurrency: NonZeroU16::MIN,
         }
     }
 
@@ -95,7 +106,16 @@ impl EventityPg {
         self
     }
 
+    /// Runs independent outbox batches concurrently. Each worker holds one
+    /// database connection while publishing. Aggregate ordering is still enforced
+    /// by row locks; size the pool for workers plus consumers and application work.
+    pub fn with_outbox_concurrency(mut self, concurrency: NonZeroU16) -> Self {
+        self.outbox_concurrency = concurrency;
+        self
+    }
+
     pub(crate) fn notify_outbox(&self) {
+        self.outbox_ready.notify_waiters();
         self.outbox_ready.notify_one();
     }
 
@@ -206,6 +226,37 @@ impl EventityPg {
         .rows_affected())
     }
 
+    /// Insert in UUID order so overlapping batches acquire unique-index locks
+    /// consistently. RETURNING distinguishes new events from redeliveries.
+    pub(crate) async fn create_inbox_batch(
+        &self,
+        tx: &mut PgTransaction<'_>,
+        consumer: &str,
+        records: &[(uuid::Uuid, Value)],
+    ) -> Result<std::collections::HashSet<uuid::Uuid>, sqlx::Error> {
+        let mut ordered: Vec<_> = records.iter().collect();
+        ordered.sort_unstable_by_key(|(id, _)| *id);
+        let mut inserted = std::collections::HashSet::with_capacity(records.len());
+        for chunk in ordered.chunks(1000) {
+            let mut builder: QueryBuilder<Postgres> =
+                QueryBuilder::new("INSERT INTO inbox (id, consumer, event_type, payload) ");
+            builder.push_values(chunk, |mut row, (id, payload)| {
+                row.push_bind(*id)
+                    .push_bind(consumer)
+                    .push_bind(consumer)
+                    .push_bind(sqlx::types::Json(payload));
+            });
+            builder.push(" ON CONFLICT (consumer, id) DO NOTHING RETURNING id");
+            inserted.extend(
+                builder
+                    .build_query_scalar::<uuid::Uuid>()
+                    .fetch_all(&mut **tx)
+                    .await?,
+            );
+        }
+        Ok(inserted)
+    }
+
     pub(crate) async fn start_outbox_worker_with_cancel(
         self: &Arc<Self>,
         broker: Arc<crate::RabbitMQ>,
@@ -214,39 +265,55 @@ impl EventityPg {
         tokio::task::JoinHandle<Result<(), crate::errors::EventityError>>,
         crate::errors::EventityError,
     > {
-        let pg = Arc::clone(self);
+        let store = Arc::clone(self);
         Ok(tokio::spawn(async move {
-            let mut retry_delay = Duration::from_millis(500);
-            loop {
-                if cancel.is_cancelled() {
-                    return Ok(());
-                }
-                // Finish a claimed batch before shutdown: dropping publication
-                // futures can leave broker acceptance ambiguous.
-                match pg.process_next_outbox(&broker).await {
-                    Ok(true) => {
-                        retry_delay = Duration::from_millis(500);
-                        continue;
-                    }
-                    Ok(false) => {
-                        retry_delay = Duration::from_millis(500);
-                        tokio::select! {
-                            _ = cancel.cancelled() => return Ok(()),
-                            _ = pg.outbox_ready.notified() => {},
-                            _ = tokio::time::sleep(pg.outbox_options.poll_interval) => {},
-                        }
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, ?retry_delay, "outbox processing failed; retrying");
-                        tokio::select! {
-                            _ = cancel.cancelled() => return Ok(()),
-                            _ = tokio::time::sleep(retry_delay) => {},
-                        }
-                        retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
-                    }
+            let mut workers = tokio::task::JoinSet::new();
+            for _ in 0..store.outbox_concurrency.get() {
+                let (store, broker, cancel) = (store.clone(), broker.clone(), cancel.clone());
+                workers.spawn(async move { store.run_outbox_worker(&broker, cancel).await });
+            }
+            let mut first_error = None;
+            while let Some(result) = workers.join_next().await {
+                if let Err(error) = result {
+                    cancel.cancel();
+                    first_error.get_or_insert(crate::EventityError::Join(error.to_string()));
                 }
             }
+            first_error.map_or(Ok(()), Err)
         }))
+    }
+
+    async fn run_outbox_worker(&self, broker: &crate::RabbitMQ, cancel: CancellationToken) {
+        let mut retry_delay = Duration::from_millis(500);
+        loop {
+            if cancel.is_cancelled() {
+                return;
+            }
+            // Finish a claimed batch before shutdown: dropping publication
+            // futures can leave broker acceptance ambiguous.
+            match self.process_next_outbox(broker).await {
+                Ok(true) => {
+                    retry_delay = Duration::from_millis(500);
+                    continue;
+                }
+                Ok(false) => {
+                    retry_delay = Duration::from_millis(500);
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        _ = self.outbox_ready.notified() => {},
+                        _ = tokio::time::sleep(self.outbox_options.poll_interval) => {},
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, ?retry_delay, "outbox processing failed; retrying");
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        _ = tokio::time::sleep(retry_delay) => {},
+                    }
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+                }
+            }
+        }
     }
 
     async fn process_next_outbox(
@@ -256,7 +323,7 @@ impl EventityPg {
         let mut tx = self.pool.begin().await?;
         let events = sqlx::query_as::<_, PendingOutboxRecord>(
             r#"
-    SELECT o.id, o.event_id, o.exchange, o.payload, o.attempt_count
+    SELECT o.id, o.event_id, o.exchange, o.payload::text AS payload, o.attempt_count
     FROM outbox AS o
     WHERE o.processed_at IS NULL
       AND o.next_attempt_at <= now()
@@ -289,16 +356,18 @@ impl EventityPg {
         let mut publishes: FuturesUnordered<_> = events
             .into_iter()
             .map(|record| async move {
-                let message = Message {
-                    event_id: record.event_id,
-                    exchange_name: ShortString::from(record.exchange),
-                    payload: restore_outbox_payload(record.payload),
-                };
-                (
-                    record.id,
-                    record.attempt_count.saturating_add(1),
-                    broker.publish(message).await,
-                )
+                let result = async {
+                    let payload = encoded_outbox_payload(&record.payload)?;
+                    broker
+                        .publish_raw(
+                            record.event_id,
+                            &ShortString::from(record.exchange),
+                            &payload,
+                        )
+                        .await
+                }
+                .await;
+                (record.id, record.attempt_count.saturating_add(1), result)
             })
             .collect();
         let mut completed = Vec::new();

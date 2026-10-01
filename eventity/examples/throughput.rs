@@ -76,6 +76,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(concurrency.to_string())
         .parse()?;
     let warmup: u64 = std::env::args().nth(5).unwrap_or("0".into()).parse()?;
+    let consumer_batch: NonZeroU16 = std::env::args().nth(6).unwrap_or("1".into()).parse()?;
+    let outbox_workers: NonZeroU16 = std::env::args().nth(7).unwrap_or("1".into()).parse()?;
     let schema = format!("eventity_bench_{}", uuid::Uuid::now_v7().simple());
     ROUTE.set(schema.clone()).unwrap();
     let db = std::env::var("DATABASE_URL")
@@ -87,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let search_path = format!("SET search_path TO {schema}");
     let pool = PgPoolOptions::new()
-        .max_connections(u32::from(concurrency.get()) + 4)
+        .max_connections(u32::from(concurrency.get()) + u32::from(outbox_workers.get()) + 4)
         .after_connect(move |conn, _| {
             let sql = search_path.clone();
             Box::pin(async move {
@@ -98,22 +100,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect(&db)
         .await?;
     let store = Arc::new(
-        EventityPg::new(pool.clone()).with_outbox_options(OutboxOptions {
-            batch_size,
-            ..Default::default()
-        }),
+        EventityPg::new(pool.clone())
+            .with_outbox_options(OutboxOptions {
+                batch_size,
+                ..Default::default()
+            })
+            .with_outbox_concurrency(outbox_workers),
     );
     store.migrate().await?;
     let bus = MessageBus::builder()
         .broker(Arc::new(RabbitMQ::new(&amqp).await?))
         .store(store)
         .request_handler(Handler)
-        .event_handler_with_options::<Event, _>(
+        .event_handler_with_batching::<Event, _>(
             Handler,
             ConsumerOptions {
                 concurrency,
                 prefetch,
             },
+            consumer_batch,
         )
         .build()
         .await?;
@@ -174,7 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         count as f64 / elapsed.as_secs_f64()
     );
     println!(
-        "outbox_complete_s={:.3} batch_size={batch_size} prefetch={prefetch} warmup={warmup}",
+        "outbox_complete_s={:.3} batch_size={batch_size} prefetch={prefetch} warmup={warmup} consumer_batch={consumer_batch} outbox_workers={outbox_workers}",
         published_at.unwrap().as_secs_f64()
     );
     bus.shutdown().await?;

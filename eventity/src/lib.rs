@@ -35,7 +35,9 @@
 #![warn(missing_docs)]
 
 mod bus;
+mod consumer;
 mod errors;
+mod rabbitmq;
 
 pub use errors::EventityError;
 mod event;
@@ -54,8 +56,8 @@ pub use request::HandlerResult;
 pub use request::Request;
 pub use request::RequestHandler;
 
-pub use bus::RabbitMQ;
 pub use bus::{ConsumerOptions, InvokeError, MessageBus, MessageBusBuilder, RunningBus};
+pub use rabbitmq::RabbitMQ;
 
 pub use event::OutgoingMessages;
 
