@@ -1,5 +1,8 @@
 use crate::EventityError;
-use lapin::options::*;
+use lapin::options::{
+    BasicConsumeOptions, BasicPublishOptions, BasicQosOptions, ConfirmSelectOptions,
+    ExchangeDeclareOptions, QueueBindOptions, QueueDeclareOptions,
+};
 use lapin::types::{AMQPValue, FieldTable, ShortString};
 use lapin::{
     BasicProperties, Channel, Connection, ConnectionProperties, Consumer, ExchangeKind, Queue,
@@ -7,7 +10,11 @@ use lapin::{
 #[cfg(test)]
 use serde_json::Value;
 use sqlx::types::uuid;
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    num::NonZeroU16,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 macro_rules! recover_channel_call {
     ($channel:expr, $future:expr) => {{
@@ -31,7 +38,12 @@ macro_rules! recover_channel_call {
 /// Create one instance and share it with the bus builder.
 pub struct RabbitMQ {
     connection: Connection,
-    publishing_connection: Connection,
+    publishers: Box<[PublishingConnection]>,
+    next_publisher: AtomicUsize,
+}
+
+struct PublishingConnection {
+    connection: Connection,
     publisher: tokio::sync::Mutex<Option<Publisher>>,
 }
 
@@ -47,13 +59,30 @@ impl RabbitMQ {
     /// recoverable disconnect is handled by Lapin's Reconnect and topology
     /// recovery mechanism.
     pub async fn new(connection_string: impl AsRef<str>) -> Result<Self, EventityError> {
-        let connection = Self::connect(connection_string.as_ref()).await?;
-        // Broker flow control on publishing must not block consumer acks.
-        let publishing_connection = Self::connect(connection_string.as_ref()).await?;
+        Self::new_with_publisher_connections(connection_string, NonZeroU16::MIN).await
+    }
+
+    /// Opens a bounded pool of publishing connections alongside the consumer
+    /// connection. Every connection reuses a confirm-enabled channel. Increase
+    /// this only when profiling shows publishing is the bottleneck; each entry
+    /// adds a broker TCP connection and its own recovery state.
+    pub async fn new_with_publisher_connections(
+        connection_string: impl AsRef<str>,
+        count: NonZeroU16,
+    ) -> Result<Self, EventityError> {
+        let uri = connection_string.as_ref();
+        let connection = Self::connect(uri).await?;
+        let mut publishers = Vec::with_capacity(usize::from(count.get()));
+        for _ in 0..count.get() {
+            publishers.push(PublishingConnection {
+                connection: Self::connect(uri).await?,
+                publisher: tokio::sync::Mutex::new(None),
+            });
+        }
         Ok(Self {
             connection,
-            publishing_connection,
-            publisher: tokio::sync::Mutex::new(None),
+            publishers: publishers.into_boxed_slice(),
+            next_publisher: AtomicUsize::new(0),
         })
     }
 
@@ -238,7 +267,9 @@ impl RabbitMQ {
         &self,
         exchange: &ShortString,
     ) -> Result<Channel, EventityError> {
-        let mut publisher = self.publisher.lock().await;
+        let index = self.next_publisher.fetch_add(1, Ordering::Relaxed) % self.publishers.len();
+        let connection = &self.publishers[index];
+        let mut publisher = connection.publisher.lock().await;
         if publisher
             .as_ref()
             .is_some_and(|p| !p.channel.status().connected() && !p.channel.status().reconnecting())
@@ -246,7 +277,7 @@ impl RabbitMQ {
             *publisher = None;
         }
         if publisher.is_none() {
-            let channel = self.publishing_connection.create_channel().await?;
+            let channel = connection.connection.create_channel().await?;
             recover_channel_call!(
                 channel,
                 channel.confirm_select(ConfirmSelectOptions::default())

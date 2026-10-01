@@ -1,7 +1,9 @@
 use crate::consumer::{prepare_consumer_with_timeout, run_consumer};
 use crate::errors::EventityError;
 use crate::registry::HandlerRegistry;
-use crate::{EventHandler, EventityPg, IntegrationEvent, RabbitMQ, Request, RequestHandler};
+use crate::{
+    EventityPg, IntegrationEvent, RabbitMQ, Request, RequestHandler, TransactionalEventHandler,
+};
 use async_trait::async_trait;
 use std::{collections::HashSet, sync::Arc};
 use tokio::task::{JoinHandle, JoinSet};
@@ -26,6 +28,25 @@ impl Default for ConsumerOptions {
         Self {
             concurrency: std::num::NonZeroU16::MIN,
             prefetch: std::num::NonZeroU16::MIN,
+        }
+    }
+}
+
+/// Bounds transaction grouping and the optional time spent filling a batch.
+#[derive(Clone, Copy, Debug)]
+pub struct BatchOptions {
+    /// Maximum deliveries sharing one transaction. Defaults to one.
+    pub max_messages: std::num::NonZeroU16,
+    /// Maximum time from the first delivery to dispatching a partial batch.
+    /// Zero processes ready deliveries immediately. A short wait can amortize
+    /// inbox writes when broker deliveries arrive in small bursts.
+    pub max_wait: std::time::Duration,
+}
+impl Default for BatchOptions {
+    fn default() -> Self {
+        Self {
+            max_messages: std::num::NonZeroU16::MIN,
+            max_wait: std::time::Duration::ZERO,
         }
     }
 }
@@ -107,7 +128,10 @@ impl<B, S> MessageBusBuilder<B, S> {
     ///
     /// The queue is created as durable and configured with a dead-letter queue.
     /// Each queue can be registered only once on a bus.
-    pub fn event_handler<E: IntegrationEvent, H: EventHandler<E>>(self, handler: H) -> Self {
+    pub fn event_handler<E: IntegrationEvent, H: TransactionalEventHandler<E>>(
+        self,
+        handler: H,
+    ) -> Self {
         self.event_handler_with_concurrency::<E, H>(handler, std::num::NonZeroU16::MIN)
     }
     /// Registers an event handler with the requested concurrent delivery limit.
@@ -115,7 +139,7 @@ impl<B, S> MessageBusBuilder<B, S> {
     /// The non-zero concurrency value is also used as the RabbitMQ channel's
     /// prefetch count, so the broker does not send more unacknowledged messages
     /// than this worker can process concurrently.
-    pub fn event_handler_with_concurrency<E: IntegrationEvent, H: EventHandler<E>>(
+    pub fn event_handler_with_concurrency<E: IntegrationEvent, H: TransactionalEventHandler<E>>(
         self,
         handler: H,
         concurrency: std::num::NonZeroU16,
@@ -132,7 +156,7 @@ impl<B, S> MessageBusBuilder<B, S> {
     /// Concurrent handlers may complete out of order; use concurrency one
     /// when processing order is required. Prefetch below concurrency limits
     /// the effective parallelism to the prefetch value.
-    pub fn event_handler_with_options<E: IntegrationEvent, H: EventHandler<E>>(
+    pub fn event_handler_with_options<E: IntegrationEvent, H: TransactionalEventHandler<E>>(
         self,
         handler: H,
         options: ConsumerOptions,
@@ -149,11 +173,34 @@ impl<B, S> MessageBusBuilder<B, S> {
     /// to isolate the failure. External effects must tolerate this replay.
     /// Acknowledgements are sent only after commit. Use batch size one for an
     /// independent transaction per delivery (the default).
-    pub fn event_handler_with_batching<E: IntegrationEvent, H: EventHandler<E>>(
-        mut self,
+    pub fn event_handler_with_batching<E: IntegrationEvent, H: TransactionalEventHandler<E>>(
+        self,
         handler: H,
         options: ConsumerOptions,
         batch_size: std::num::NonZeroU16,
+    ) -> Self {
+        self.event_handler_with_batch_options::<E, H>(
+            handler,
+            options,
+            BatchOptions {
+                max_messages: batch_size,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Registers a handler with bounded transaction batches and an optional
+    /// collection deadline. Transaction and replay semantics are the same as
+    /// [`Self::event_handler_with_batching`]. Waiting applies only to partial
+    /// batches, measured from the first delivery; full batches run immediately.
+    pub fn event_handler_with_batch_options<
+        E: IntegrationEvent,
+        H: TransactionalEventHandler<E>,
+    >(
+        mut self,
+        handler: H,
+        options: ConsumerOptions,
+        batching: BatchOptions,
     ) -> Self {
         if !self.event_queues.insert(E::queue()) {
             self.configuration_error = Some(EventityError::DuplicateEventQueue(E::queue()));
@@ -162,7 +209,7 @@ impl<B, S> MessageBusBuilder<B, S> {
         self.subscriptions.push(Box::new(EventSubscription::<E, H> {
             handler: Arc::new(handler),
             options,
-            batch_size,
+            batching,
             _event: std::marker::PhantomData,
         }));
         self
@@ -228,14 +275,14 @@ trait Subscription: Send + Sync {
 struct EventSubscription<E, H> {
     handler: Arc<H>,
     options: ConsumerOptions,
-    batch_size: std::num::NonZeroU16,
+    batching: BatchOptions,
     _event: std::marker::PhantomData<fn(E)>,
 }
 #[async_trait]
 impl<E, H> Subscription for EventSubscription<E, H>
 where
     E: IntegrationEvent,
-    H: EventHandler<E>,
+    H: TransactionalEventHandler<E>,
 {
     async fn start(
         &self,
@@ -243,7 +290,7 @@ where
         store: Arc<EventityPg>,
         cancel: CancellationToken,
     ) -> Result<JoinHandle<Result<(), EventityError>>, EventityError> {
-        let batch_size = usize::from(self.batch_size.get());
+        let batching = self.batching;
         let concurrency = self.options.concurrency.get();
         let prefetch = self.options.prefetch.get();
         let consumer = prepare_consumer_with_timeout::<E>(&broker, prefetch).await?;
@@ -280,7 +327,7 @@ where
                     handler.clone(),
                     cancel.clone(),
                     usize::from(concurrency),
-                    batch_size,
+                    batching,
                 )
                 .await
                 {

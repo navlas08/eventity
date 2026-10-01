@@ -1,12 +1,12 @@
+use crate::BatchOptions;
 use crate::postgres::InboxRecord;
-use crate::{EventHandler, EventityError, EventityPg, IntegrationEvent, RabbitMQ};
-use futures_lite::StreamExt;
-use futures_util::FutureExt;
+use crate::{EventityError, EventityPg, IntegrationEvent, RabbitMQ, TransactionalEventHandler};
+use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use lapin::message::Delivery;
 use lapin::options::{BasicAckOptions, BasicNackOptions};
 use lapin::types::ShortString;
 use lapin::{Channel, Consumer};
-use serde_json::Value;
+use serde_json::value::RawValue;
 use sqlx::types::uuid;
 use std::{str::FromStr, sync::Arc};
 use tokio::task::JoinSet;
@@ -47,11 +47,11 @@ pub(crate) async fn run_consumer<E, H>(
     handler: Arc<H>,
     cancel: CancellationToken,
     limit: usize,
-    batch_size: usize,
+    batching: BatchOptions,
 ) -> Result<(), EventityError>
 where
     E: IntegrationEvent,
-    H: EventHandler<E>,
+    H: TransactionalEventHandler<E>,
 {
     let result = run_consumer_deliveries::<E, H>(
         consumer,
@@ -60,7 +60,7 @@ where
         handler,
         cancel,
         limit,
-        batch_size,
+        batching,
     )
     .await;
     // Closing also requeues deliveries that were prefetched but never started.
@@ -83,11 +83,11 @@ async fn run_consumer_deliveries<E, H>(
     handler: Arc<H>,
     cancel: CancellationToken,
     limit: usize,
-    batch_size: usize,
+    batching: BatchOptions,
 ) -> Result<(), EventityError>
 where
     E: IntegrationEvent,
-    H: EventHandler<E>,
+    H: TransactionalEventHandler<E>,
 {
     let mut tasks = JoinSet::new();
     loop {
@@ -95,22 +95,10 @@ where
             _ = cancel.cancelled() => break,
             delivery = consumer.next(), if tasks.len() < limit => match delivery {
                 Some(Ok(delivery)) => {
-                    let mut deliveries = Vec::with_capacity(batch_size.min(32));
-                    deliveries.push(delivery);
-                    // Poll only ready deliveries: no latency penalty at low load.
-                    // Consumer errors encountered here are handled after this batch
-                    // is scheduled, so an already-read delivery is never discarded.
-                    let mut stream_error = None;
-                    while deliveries.len() < batch_size {
-                        match consumer.next().now_or_never() {
-                            Some(Some(Ok(delivery))) => deliveries.push(delivery),
-                            Some(Some(Err(error))) => { stream_error = Some(error); break; }
-                            _ => break,
-                        }
-                    }
+                    let (deliveries, stream_error) = collect_batch(&mut consumer, delivery, batching, &cancel).await;
                     let (store, handler) = (store.clone(), handler.clone());
                     tasks.spawn(async move {
-                        process_and_settle::<E, H>(&store, &handler, deliveries).await
+                        process_and_settle::<E, H>(&store, &handler, deliveries, limit == 1).await
                     });
                     if let Some(error) = stream_error {
                         tokio::select! {
@@ -148,6 +136,39 @@ where
     Ok(())
 }
 
+/// Keep a fixed deadline from the first delivery so a slow stream cannot hold
+/// a transaction batch indefinitely. No transaction is opened while collecting.
+async fn collect_batch(
+    consumer: &mut Consumer,
+    first: Delivery,
+    options: BatchOptions,
+    cancel: &CancellationToken,
+) -> (Vec<Delivery>, Option<lapin::Error>) {
+    let limit = usize::from(options.max_messages.get());
+    let mut deliveries = Vec::with_capacity(limit.min(32));
+    deliveries.push(first);
+    let deadline = tokio::time::Instant::now() + options.max_wait;
+    while deliveries.len() < limit {
+        let next = match consumer.next().now_or_never() {
+            Some(next) => next,
+            None if options.max_wait.is_zero() => break,
+            None => tokio::select! {
+                _ = cancel.cancelled() => break,
+                result = tokio::time::timeout_at(deadline, consumer.next()) => match result {
+                    Ok(next) => next,
+                    Err(_) => break,
+                },
+            },
+        };
+        match next {
+            Some(Ok(delivery)) => deliveries.push(delivery),
+            Some(Err(error)) => return (deliveries, Some(error)),
+            None => break,
+        }
+    }
+    (deliveries, None)
+}
+
 /// Settle individually: `multiple: true` could acknowledge unfinished work
 /// belonging to another concurrently executing batch on this channel.
 async fn settle(
@@ -181,16 +202,34 @@ async fn process_and_settle<E, H>(
     store: &EventityPg,
     handler: &H,
     deliveries: Vec<Delivery>,
+    exclusive: bool,
 ) -> Result<(), EventityError>
 where
     E: IntegrationEvent,
-    H: EventHandler<E>,
+    H: TransactionalEventHandler<E>,
 {
+    tracing::debug!(target: "eventity::consumer", consumer_messages = deliveries.len() as u64,
+        consumer_batches = 1_u64, "processing delivery batch");
     if deliveries.len() > 1 {
         match process_batch::<E, H>(store, handler, &deliveries).await {
             Ok(()) => {
-                for delivery in &deliveries {
-                    settle(delivery, Ok(())).await?;
+                // With one active batch, every earlier delivery has already
+                // settled. A cumulative ack cannot cover unfinished work.
+                // Concurrent batches must retain individual acknowledgements.
+                if exclusive {
+                    deliveries
+                        .last()
+                        .expect("nonempty batch")
+                        .ack(BasicAckOptions { multiple: true })
+                        .await?;
+                    return Ok(());
+                }
+                let mut acknowledgements: FuturesUnordered<_> = deliveries
+                    .iter()
+                    .map(|delivery| delivery.ack(BasicAckOptions::default()))
+                    .collect();
+                while let Some(result) = acknowledgements.next().await {
+                    result?;
                 }
                 return Ok(());
             }
@@ -238,14 +277,14 @@ async fn process_batch<E, H>(
 ) -> Result<(), EventityError>
 where
     E: IntegrationEvent,
-    H: EventHandler<E>,
+    H: TransactionalEventHandler<E>,
 {
     let mut events = Vec::with_capacity(deliveries.len());
     let mut records = Vec::with_capacity(deliveries.len());
     for delivery in deliveries {
         let id = message_id(delivery)?;
-        let payload: Value = serde_json::from_slice(&delivery.data)?;
-        let event = E::deserialize(&payload)?;
+        let payload: &RawValue = serde_json::from_slice(&delivery.data)?;
+        let event: E = serde_json::from_str(payload.get())?;
         events.push((id, event));
         records.push((id, payload));
     }
@@ -258,7 +297,7 @@ where
         // Also suppress duplicate IDs appearing within this batch.
         if inserted.remove(&id) {
             let messages = handler
-                .handle_transactional(event, &mut tx)
+                .handle_in_transaction(event, &mut tx)
                 .await
                 .map_err(|error| EventityError::Handler(format!("{error:?}")))?;
             outgoing.extend(messages.into_records()?);
@@ -279,10 +318,10 @@ async fn process_delivery<E, H>(
 ) -> Result<(), EventityError>
 where
     E: IntegrationEvent,
-    H: EventHandler<E>,
+    H: TransactionalEventHandler<E>,
 {
-    let payload: Value = serde_json::from_slice(&delivery.data)?;
-    let event = E::deserialize(&payload)?;
+    let payload: &RawValue = serde_json::from_slice(&delivery.data)?;
+    let event: E = serde_json::from_str(payload.get())?;
     let event_id = message_id(delivery)?;
     let mut tx = store.get_transaction().await?;
     let inserted = store
@@ -301,7 +340,7 @@ where
         return Ok(());
     }
     let outgoing = handler
-        .handle_transactional(event, &mut tx)
+        .handle_in_transaction(event, &mut tx)
         .await
         .map_err(|error| EventityError::Handler(format!("{error:?}")))?;
     let records = outgoing.into_records()?;
@@ -316,11 +355,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EventHandler;
     use crate::rabbitmq::Message;
     use crate::test_support::Resources;
     use async_trait::async_trait;
     use lapin::BasicProperties;
     use serde::{Deserialize, Serialize};
+    use serde_json::Value;
 
     #[derive(Serialize, Deserialize)]
     struct TestEvent {
@@ -444,6 +485,50 @@ mod tests {
         assert!(message.is_some());
         r.cleanup().await;
     }
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL and RabbitMQ; set DATABASE_URL and AMQP_URL"]
+    async fn publisher_pool_recovers_each_cached_channel_independently() {
+        let r = Resources::new().await;
+        let broker = RabbitMQ::new_with_publisher_connections(
+            std::env::var("AMQP_URL").unwrap(),
+            std::num::NonZeroU16::new(2).unwrap(),
+        )
+        .await
+        .unwrap();
+        let exchange: ShortString = r.schema.clone().into();
+        let first = broker.publisher_channel(&exchange).await.unwrap();
+        let second = broker.publisher_channel(&exchange).await.unwrap();
+        first
+            .close(200, "test pool replacement".into())
+            .await
+            .unwrap();
+        assert!(second.status().connected());
+        for id in 0..4 {
+            broker
+                .publish(Message {
+                    event_id: uuid::Uuid::now_v7(),
+                    exchange_name: exchange.clone(),
+                    payload: serde_json::json!({"id": id}),
+                })
+                .await
+                .unwrap();
+        }
+        for id in 0..4 {
+            let message = r
+                .channel
+                .basic_get(
+                    exchange.clone(),
+                    lapin::options::BasicGetOptions { no_ack: true },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let payload: Value = serde_json::from_slice(&message.delivery.data).unwrap();
+            assert_eq!(payload["id"], id);
+        }
+        assert!(second.status().connected());
+        r.cleanup().await;
+    }
     struct BlockingHandler {
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
@@ -489,7 +574,7 @@ mod tests {
             handler,
             cancel.clone(),
             1,
-            1,
+            BatchOptions::default(),
         ));
         tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
             .await
@@ -534,6 +619,207 @@ mod tests {
                 .await,
             Err(EventityError::MissingMessageId)
         ));
+        r.cleanup().await;
+    }
+    async fn deliveries(r: &Resources, events: &[(uuid::Uuid, u64, bool)]) -> Vec<Delivery> {
+        for &(event_id, id, fail) in events {
+            r.broker
+                .publish(Message {
+                    event_id,
+                    exchange_name: r.schema.clone().into(),
+                    payload: serde_json::json!({"id": id, "fail": fail}),
+                })
+                .await
+                .unwrap();
+        }
+        let mut deliveries = Vec::new();
+        for _ in events {
+            let message = r
+                .channel
+                .basic_get(r.schema.clone().into(), Default::default())
+                .await
+                .unwrap()
+                .unwrap();
+            deliveries.push(message.delivery);
+        }
+        deliveries
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL and RabbitMQ; set DATABASE_URL and AMQP_URL"]
+    async fn batch_deduplicates_within_and_across_concurrent_transactions() {
+        let r = Resources::new().await;
+        sqlx::query("CREATE TABLE effects (id bigint)")
+            .execute(&r.pool)
+            .await
+            .unwrap();
+        let first = uuid::Uuid::now_v7();
+        let events = deliveries(
+            &r,
+            &[
+                (first, 1, false),
+                (first, 999, false),
+                (uuid::Uuid::now_v7(), 2, false),
+            ],
+        )
+        .await;
+        let (left, right) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                process_batch::<TestEvent, _>(&r.store, &TransactionalHandler, &events),
+                process_batch::<TestEvent, _>(&r.store, &TransactionalHandler, &events),
+            )
+        })
+        .await
+        .unwrap();
+        left.unwrap();
+        right.unwrap();
+        let effects: Vec<i64> = sqlx::query_scalar("SELECT id FROM effects ORDER BY id")
+            .fetch_all(&r.pool)
+            .await
+            .unwrap();
+        assert_eq!(effects, [1, 2]);
+        let payload: Value = sqlx::query_scalar("SELECT payload FROM inbox WHERE id = $1")
+            .bind(first)
+            .fetch_one(&r.pool)
+            .await
+            .unwrap();
+        assert_eq!(payload["id"], 1);
+        for delivery in events {
+            delivery.ack(Default::default()).await.unwrap();
+        }
+        r.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL and RabbitMQ; set DATABASE_URL and AMQP_URL"]
+    async fn failed_batch_rolls_back_and_isolates_poison_message() {
+        let r = Resources::new().await;
+        sqlx::query("CREATE TABLE effects (id bigint)")
+            .execute(&r.pool)
+            .await
+            .unwrap();
+        let events = deliveries(
+            &r,
+            &[
+                (uuid::Uuid::now_v7(), 1, false),
+                (uuid::Uuid::now_v7(), 2, true),
+                (uuid::Uuid::now_v7(), 3, false),
+            ],
+        )
+        .await;
+        assert!(
+            process_batch::<TestEvent, _>(&r.store, &TransactionalHandler, &events)
+                .await
+                .is_err()
+        );
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM effects")
+            .fetch_one(&r.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        process_and_settle::<TestEvent, _>(&r.store, &TransactionalHandler, events, false)
+            .await
+            .unwrap();
+        let effects: Vec<i64> = sqlx::query_scalar("SELECT id FROM effects ORDER BY id")
+            .fetch_all(&r.pool)
+            .await
+            .unwrap();
+        assert_eq!(effects, [1, 3]);
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM inbox")
+            .fetch_one(&r.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        assert!(
+            r.channel
+                .basic_get(r.schema.clone().into(), Default::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        r.cleanup().await;
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL and RabbitMQ; set DATABASE_URL and AMQP_URL"]
+    async fn partial_batch_deadline_and_exclusive_ack_preserve_later_deliveries() {
+        struct NativeHandler;
+        impl TransactionalEventHandler<TestEvent> for NativeHandler {
+            async fn handle_in_transaction(
+                &self,
+                _: TestEvent,
+                _: &mut sqlx::PgTransaction<'_>,
+            ) -> crate::EHandlerResult<String> {
+                Ok(crate::OutgoingMessages::none())
+            }
+        }
+        let r = Resources::new().await;
+        let (mut consumer, channel) = r
+            .broker
+            .declare_consumer(r.schema.clone().into(), 8)
+            .await
+            .unwrap();
+        for id in 0..3 {
+            r.broker
+                .publish(Message {
+                    event_id: uuid::Uuid::now_v7(),
+                    exchange_name: r.schema.clone().into(),
+                    payload: serde_json::json!({"id": id, "fail": false}),
+                })
+                .await
+                .unwrap();
+        }
+        let first = consumer.next().await.unwrap().unwrap();
+        let wait = std::time::Duration::from_millis(20);
+        let started = tokio::time::Instant::now();
+        let (batch, error) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            collect_batch(
+                &mut consumer,
+                first,
+                BatchOptions {
+                    max_messages: std::num::NonZeroU16::new(4).unwrap(),
+                    max_wait: wait,
+                },
+                &CancellationToken::new(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(error.is_none());
+        assert_eq!(batch.len(), 3);
+        assert!(started.elapsed() >= wait);
+        // These deliveries are already outstanding when the earlier batch
+        // commits. Its cumulative ack must not acknowledge them.
+        for id in 3..5 {
+            r.broker
+                .publish(Message {
+                    event_id: uuid::Uuid::now_v7(),
+                    exchange_name: r.schema.clone().into(),
+                    payload: serde_json::json!({"id": id, "fail": false}),
+                })
+                .await
+                .unwrap();
+            consumer.next().await.unwrap().unwrap();
+        }
+        process_and_settle::<TestEvent, _>(&r.store, &NativeHandler, batch, true)
+            .await
+            .unwrap();
+        channel.close(200, "test requeue".into()).await.unwrap();
+        let queue = r
+            .channel
+            .queue_declare(
+                r.schema.clone().into(),
+                lapin::options::QueueDeclareOptions::durable(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queue.message_count(), 2);
+        let inbox: i64 = sqlx::query_scalar("SELECT count(*) FROM inbox")
+            .fetch_one(&r.pool)
+            .await
+            .unwrap();
+        assert_eq!(inbox, 3);
         r.cleanup().await;
     }
 }

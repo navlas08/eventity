@@ -18,3 +18,6 @@ let bus = MessageBus::builder()
 let order_id = bus.invoke(CreateOrder { /* ... */ }).await?;
 bus.shutdown().await?;
 ```
+
+See the [performance guide](../docs/performance.md) for transaction batching, native async handlers,
+and reproducible consumer and end-to-end benchmarks.

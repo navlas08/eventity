@@ -2,7 +2,7 @@ use futures_util::{StreamExt, stream::FuturesUnordered};
 use lapin::types::ShortString;
 use serde_json::Value;
 use sqlx::types::uuid;
-use sqlx::{FromRow, PgTransaction, Postgres, QueryBuilder};
+use sqlx::{FromRow, PgTransaction};
 pub(crate) use sqlx::{PgPool, query};
 use std::sync::Arc;
 use std::{num::NonZeroU16, time::Duration};
@@ -43,12 +43,11 @@ pub(crate) struct OutboxRecord {
     pub payload: Value,
 }
 
-#[derive(FromRow)]
-pub(crate) struct InboxRecord {
+pub(crate) struct InboxRecord<'a> {
     pub(crate) id: uuid::Uuid,
     pub(crate) consumer: String,
     pub(crate) event_type: String,
-    pub(crate) payload: Value,
+    pub(crate) payload: &'a serde_json::value::RawValue,
 }
 
 #[derive(FromRow)]
@@ -187,22 +186,33 @@ impl EventityPg {
             if batch.is_empty() {
                 return Ok(inserted);
             }
-            let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
-                "INSERT INTO outbox (event_id, aggregate_type, aggregate_id, event_type, payload, exchange) ",
-            );
-            query_builder.push_values(batch, |mut b, record| {
-                b.push_bind(record.event_id)
-                    .push_bind(record.aggregate_type)
-                    .push_bind(record.aggregate_id)
-                    .push_bind(record.event_type)
-                    .push_bind(sqlx::types::Json(record.payload))
-                    .push_bind(record.exchange);
-            });
-            inserted += query_builder
-                .build()
-                .execute(&mut **tx)
-                .await?
-                .rows_affected();
+            let mut ids = Vec::with_capacity(batch.len());
+            let mut aggregate_types = Vec::with_capacity(batch.len());
+            let mut aggregate_ids = Vec::with_capacity(batch.len());
+            let mut event_types = Vec::with_capacity(batch.len());
+            let mut payloads = Vec::with_capacity(batch.len());
+            let mut exchanges = Vec::with_capacity(batch.len());
+            for record in batch {
+                ids.push(record.event_id);
+                aggregate_types.push(record.aggregate_type);
+                aggregate_ids.push(record.aggregate_id);
+                event_types.push(record.event_type);
+                payloads.push(sqlx::types::Json(record.payload));
+                exchanges.push(record.exchange);
+            }
+            inserted += query(
+                "INSERT INTO outbox (event_id, aggregate_type, aggregate_id, event_type, payload, exchange) \
+                 SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::text[], $5::jsonb[], $6::text[])"
+            )
+            .bind(&ids)
+            .bind(&aggregate_types)
+            .bind(&aggregate_ids)
+            .bind(&event_types)
+            .bind(&payloads)
+            .bind(&exchanges)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
         }
     }
 
@@ -211,7 +221,7 @@ impl EventityPg {
     pub(crate) async fn create_inbox_record(
         &self,
         tx: &mut PgTransaction<'_>,
-        record: InboxRecord,
+        record: InboxRecord<'_>,
     ) -> Result<u64, sqlx::Error> {
         Ok(query(
             "INSERT INTO inbox (id, consumer, event_type, payload) VALUES ($1, $2, $3, $4) \
@@ -232,27 +242,32 @@ impl EventityPg {
         &self,
         tx: &mut PgTransaction<'_>,
         consumer: &str,
-        records: &[(uuid::Uuid, Value)],
+        records: &[(uuid::Uuid, &serde_json::value::RawValue)],
     ) -> Result<std::collections::HashSet<uuid::Uuid>, sqlx::Error> {
         let mut ordered: Vec<_> = records.iter().collect();
-        ordered.sort_unstable_by_key(|(id, _)| *id);
+        // Stable sorting retains the first payload for duplicate IDs, matching
+        // the first handler invocation below and single-delivery deduplication.
+        ordered.sort_by_key(|(id, _)| *id);
+        ordered.dedup_by_key(|(id, _)| *id);
         let mut inserted = std::collections::HashSet::with_capacity(records.len());
         for chunk in ordered.chunks(1000) {
-            let mut builder: QueryBuilder<Postgres> =
-                QueryBuilder::new("INSERT INTO inbox (id, consumer, event_type, payload) ");
-            builder.push_values(chunk, |mut row, (id, payload)| {
-                row.push_bind(*id)
-                    .push_bind(consumer)
-                    .push_bind(consumer)
-                    .push_bind(sqlx::types::Json(payload));
-            });
-            builder.push(" ON CONFLICT (consumer, id) DO NOTHING RETURNING id");
-            inserted.extend(
-                builder
-                    .build_query_scalar::<uuid::Uuid>()
-                    .fetch_all(&mut **tx)
-                    .await?,
-            );
+            let ids: Vec<_> = chunk.iter().map(|(id, _)| *id).collect();
+            let payloads: Vec<_> = chunk
+                .iter()
+                .map(|(_, payload)| sqlx::types::Json(payload))
+                .collect();
+            let new_ids = sqlx::query_scalar::<_, uuid::Uuid>(
+                "INSERT INTO inbox (id, consumer, event_type, payload) \
+                 SELECT id, $3, $3, payload FROM UNNEST($1::uuid[], $2::jsonb[]) AS batch(id, payload) \
+                 ORDER BY id \
+                 ON CONFLICT (consumer, id) DO NOTHING RETURNING id",
+            )
+            .bind(&ids)
+            .bind(&payloads)
+            .bind(consumer)
+            .fetch_all(&mut **tx)
+            .await?;
+            inserted.extend(new_ids);
         }
         Ok(inserted)
     }
@@ -320,6 +335,7 @@ impl EventityPg {
         &self,
         broker: &crate::RabbitMQ,
     ) -> Result<bool, crate::errors::EventityError> {
+        let started = std::time::Instant::now();
         let mut tx = self.pool.begin().await?;
         let events = sqlx::query_as::<_, PendingOutboxRecord>(
             r#"
@@ -351,6 +367,8 @@ impl EventityPg {
             tx.rollback().await?;
             return Ok(false);
         }
+        let claimed_at = std::time::Instant::now();
+        let batch_len = events.len();
         // The row locks remain held until all outcomes are persisted. Other
         // workers skip these heads and cannot overtake them within an aggregate.
         let mut publishes: FuturesUnordered<_> = events
@@ -388,6 +406,7 @@ impl EventityPg {
                 }
             }
         }
+        let published_at = std::time::Instant::now();
         if !completed.is_empty() {
             sqlx::query(
                 "UPDATE outbox SET processed_at = now(), last_error = NULL WHERE id = ANY($1)",
@@ -404,6 +423,11 @@ impl EventityPg {
                 .execute(&mut *tx).await?;
         }
         tx.commit().await?;
+        tracing::debug!(target: "eventity::outbox", messages = batch_len as u64,
+            claim_us = claimed_at.duration_since(started).as_micros() as u64,
+            publish_us = published_at.duration_since(claimed_at).as_micros() as u64,
+            commit_us = published_at.elapsed().as_micros() as u64,
+            "outbox batch completed");
         Ok(true)
     }
 }

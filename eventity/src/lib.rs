@@ -49,14 +49,16 @@ pub use eventity_macro::Event;
 pub use eventity_macro::Request;
 
 pub use event::EHandlerResult;
-pub use event::EventHandler;
 pub use event::IntegrationEvent;
+pub use event::{EventHandler, TransactionalEventHandler};
 
 pub use request::HandlerResult;
 pub use request::Request;
 pub use request::RequestHandler;
 
-pub use bus::{ConsumerOptions, InvokeError, MessageBus, MessageBusBuilder, RunningBus};
+pub use bus::{
+    BatchOptions, ConsumerOptions, InvokeError, MessageBus, MessageBusBuilder, RunningBus,
+};
 pub use rabbitmq::RabbitMQ;
 
 pub use event::OutgoingMessages;

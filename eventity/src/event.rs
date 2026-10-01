@@ -133,3 +133,47 @@ pub trait EventHandler<IE: IntegrationEvent>: Send + Sync + 'static {
         self.handle(event).await
     }
 }
+
+/// Handles an event inside the inbox/outbox transaction using a native Rust
+/// future, without requiring `async_trait` or a boxed future per invocation.
+///
+/// Implement `async fn handle_in_transaction` directly. The returned future
+/// must be `Send` because the bus schedules handlers on Tokio workers. Use the
+/// supplied transaction for database changes that must commit with the inbox.
+/// Existing [`EventHandler`] implementations implement this trait automatically;
+/// choose one of the two interfaces for a given handler type.
+///
+/// ```rust,ignore
+/// impl TransactionalEventHandler<OrderCreated> for OrderHandler {
+///     async fn handle_in_transaction(
+///         &self,
+///         event: OrderCreated,
+///         tx: &mut sqlx::PgTransaction<'_>,
+///     ) -> EHandlerResult<OrderError> {
+///         // Write application state through tx.
+///         Ok(OutgoingMessages::none())
+///     }
+/// }
+/// ```
+pub trait TransactionalEventHandler<IE: IntegrationEvent>: Send + Sync + 'static {
+    /// Processes one event and returns messages to persist in the same transaction.
+    fn handle_in_transaction(
+        &self,
+        event: IE,
+        tx: &mut sqlx::PgTransaction<'_>,
+    ) -> impl std::future::Future<Output = EHandlerResult<IE::Error>> + Send;
+}
+
+impl<IE, H> TransactionalEventHandler<IE> for H
+where
+    IE: IntegrationEvent,
+    H: EventHandler<IE>,
+{
+    async fn handle_in_transaction(
+        &self,
+        event: IE,
+        tx: &mut sqlx::PgTransaction<'_>,
+    ) -> EHandlerResult<IE::Error> {
+        self.handle_transactional(event, tx).await
+    }
+}
