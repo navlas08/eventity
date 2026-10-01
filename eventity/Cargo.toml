@@ -1,10 +1,9 @@
 [package]
 name = "eventity"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Rust-like MediatR or Wolverine.NET PostgreSQL, RabbitMQ and transactional outbox/inbox pattern"
 license = "MIT"
-license-file = "LICENSE"
 repository = "https://github.com/navlas08/eventity"
 readme = "README.md"
 keywords = ["events", "rabbitmq", "postgres", "outbox", "async"]
@@ -20,6 +19,7 @@ tokio = { version = "1.53.1", features = ["macros", "sync", "time"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
 uuid = { version = "1.26.1", features = ["v7"] }
 futures-lite = "2.6.1"
+futures-util = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
 
 thiserror = "2.0.21"
 tracing = "0.1.44"

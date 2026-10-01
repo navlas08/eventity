@@ -779,6 +779,7 @@ dependencies = [
  "async-trait",
  "eventity_macro",
  "futures-lite",
+ "futures-util",
  "lapin",
  "serde",
  "serde_json",
@@ -1855,9 +1856,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-connector"
-version = "0.23.8"
+version = "0.23.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1babecfcc65b139b812e74bcc7f9ec7b4e00db659fd42d99567b7e77f0c714c6"
+checksum = "524994fd6957827c775abc941f41a146ce351bbd0a9b8cf632ee37f43a13c205"
 dependencies = [
  "futures-io",
  "futures-rustls",

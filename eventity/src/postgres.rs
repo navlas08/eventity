@@ -1,10 +1,12 @@
 use crate::bus::Message;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use lapin::types::ShortString;
 use serde_json::Value;
 use sqlx::types::uuid;
 use sqlx::{FromRow, PgTransaction, Postgres, QueryBuilder};
 pub(crate) use sqlx::{PgPool, query};
 use std::sync::Arc;
+use std::{num::NonZeroU16, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 fn restore_outbox_payload(payload: Value) -> Value {
@@ -49,18 +51,52 @@ struct PendingOutboxRecord {
     attempt_count: i32,
 }
 
+/// Bounded outbox publishing and idle polling settings.
+#[derive(Clone, Debug)]
+pub struct OutboxOptions {
+    /// Maximum messages fetched and published concurrently per transaction.
+    /// Only the earliest pending row of each aggregate is eligible.
+    pub batch_size: NonZeroU16,
+    /// Fallback polling for commits from other processes and scheduled retries.
+    pub poll_interval: Duration,
+}
+impl Default for OutboxOptions {
+    fn default() -> Self {
+        Self {
+            batch_size: NonZeroU16::new(256).unwrap(),
+            poll_interval: Duration::from_millis(500),
+        }
+    }
+}
+
 /// PostgreSQL persistence for request transactions, inbox deduplication, and outbox delivery.
 ///
 /// Construct this with the application's SQLx `PgPool`, run
 /// [`EventityPg::migrate`], and share it with the bus and request handlers.
 pub struct EventityPg {
     pool: PgPool,
+    outbox_options: OutboxOptions,
+    outbox_ready: tokio::sync::Notify,
 }
 
 impl EventityPg {
     /// Wraps an existing SQLx PostgreSQL pool.
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            outbox_options: OutboxOptions::default(),
+            outbox_ready: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Configures outbox batching before sharing the store with a bus.
+    pub fn with_outbox_options(mut self, options: OutboxOptions) -> Self {
+        self.outbox_options = options;
+        self
+    }
+
+    pub(crate) fn notify_outbox(&self) {
+        self.outbox_ready.notify_one();
     }
 
     /// Creates the final `outbox` and `inbox` schema under a PostgreSQL advisory lock.
@@ -180,39 +216,37 @@ impl EventityPg {
     > {
         let pg = Arc::clone(self);
         Ok(tokio::spawn(async move {
-            let mut poll = tokio::time::interval(std::time::Duration::from_millis(500));
-            let mut retry_delay = std::time::Duration::from_millis(500);
+            let mut retry_delay = Duration::from_millis(500);
             loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => return Ok(()),
-                    _ = poll.tick() => tokio::select! {
-                        _ = cancel.cancelled() => return Ok(()),
-                        result = pg.process_pending_outbox(&broker) => match result {
-                            Ok(()) => retry_delay = std::time::Duration::from_millis(500),
-                            Err(error) => {
-                                tracing::error!(%error, ?retry_delay, "outbox processing failed; retrying");
-                                tokio::select! {
-                                    _ = cancel.cancelled() => return Ok(()),
-                                    _ = tokio::time::sleep(retry_delay) => {}
-                                }
-                                retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(30));
-                            }
+                if cancel.is_cancelled() {
+                    return Ok(());
+                }
+                // Finish a claimed batch before shutdown: dropping publication
+                // futures can leave broker acceptance ambiguous.
+                match pg.process_next_outbox(&broker).await {
+                    Ok(true) => {
+                        retry_delay = Duration::from_millis(500);
+                        continue;
+                    }
+                    Ok(false) => {
+                        retry_delay = Duration::from_millis(500);
+                        tokio::select! {
+                            _ = cancel.cancelled() => return Ok(()),
+                            _ = pg.outbox_ready.notified() => {},
+                            _ = tokio::time::sleep(pg.outbox_options.poll_interval) => {},
                         }
-                    },
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, ?retry_delay, "outbox processing failed; retrying");
+                        tokio::select! {
+                            _ = cancel.cancelled() => return Ok(()),
+                            _ = tokio::time::sleep(retry_delay) => {},
+                        }
+                        retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+                    }
                 }
             }
         }))
-    }
-
-    async fn process_pending_outbox(
-        &self,
-        broker: &crate::RabbitMQ,
-    ) -> Result<(), crate::errors::EventityError> {
-        loop {
-            if !self.process_next_outbox(broker).await? {
-                return Ok(());
-            }
-        }
     }
 
     async fn process_next_outbox(
@@ -220,7 +254,7 @@ impl EventityPg {
         broker: &crate::RabbitMQ,
     ) -> Result<bool, crate::errors::EventityError> {
         let mut tx = self.pool.begin().await?;
-        let event = sqlx::query_as::<_, PendingOutboxRecord>(
+        let events = sqlx::query_as::<_, PendingOutboxRecord>(
             r#"
     SELECT o.id, o.event_id, o.exchange, o.payload, o.attempt_count
     FROM outbox AS o
@@ -232,47 +266,236 @@ impl EventityPg {
             AND earlier.aggregate_id = o.aggregate_id
             AND earlier.id < o.id
             AND earlier.processed_at IS NULL
+          -- Keep this an indexed correlated lookup. An anti-join can choose
+          -- a quadratic materialized scan after statistics report no pending
+          -- rows and a new burst arrives. OFFSET 0 prevents that rewrite.
+          OFFSET 0
       )
     ORDER BY o.next_attempt_at, o.id
-    LIMIT 1
+    LIMIT $1
     FOR UPDATE OF o SKIP LOCKED
     "#,
         )
-        .fetch_optional(&mut *tx)
+        .bind(i64::from(self.outbox_options.batch_size.get()))
+        .fetch_all(&mut *tx)
         .await?;
 
-        if let Some(record) = event {
-            let attempt_count = record.attempt_count.saturating_add(1);
-            let message = Message {
-                event_id: record.event_id,
-                exchange_name: ShortString::from(record.exchange),
-                payload: restore_outbox_payload(record.payload),
-            };
-
-            if let Err(error) = broker.publish(message).await {
-                let retry_seconds = 1_i64 << attempt_count.clamp(1, 8);
-                sqlx::query(
-                    "UPDATE outbox SET attempt_count = $1, next_attempt_at = now() + ($2 * interval '1 second'), last_error = $3 WHERE id = $4",
-                )
-                .bind(attempt_count)
-                .bind(retry_seconds)
-                .bind(error.to_string())
-                .bind(record.id)
-                .execute(&mut *tx)
-                .await?;
-                tx.commit().await?;
-                tracing::error!(outbox_id = record.id, attempt_count, retry_seconds, %error, "outbox publish failed; scheduled retry");
-                return Ok(true);
-            }
-
-            sqlx::query("UPDATE outbox SET processed_at = now(), last_error = NULL WHERE id = $1")
-                .bind(record.id)
-                .execute(&mut *tx)
-                .await?;
-            tx.commit().await?;
-            return Ok(true);
+        if events.is_empty() {
+            tx.rollback().await?;
+            return Ok(false);
         }
-        tx.rollback().await?;
-        Ok(false)
+        // The row locks remain held until all outcomes are persisted. Other
+        // workers skip these heads and cannot overtake them within an aggregate.
+        let mut publishes: FuturesUnordered<_> = events
+            .into_iter()
+            .map(|record| async move {
+                let message = Message {
+                    event_id: record.event_id,
+                    exchange_name: ShortString::from(record.exchange),
+                    payload: restore_outbox_payload(record.payload),
+                };
+                (
+                    record.id,
+                    record.attempt_count.saturating_add(1),
+                    broker.publish(message).await,
+                )
+            })
+            .collect();
+        let mut completed = Vec::new();
+        let mut failed_ids = Vec::new();
+        let mut attempts = Vec::new();
+        let mut delays = Vec::new();
+        let mut errors = Vec::new();
+        while let Some((id, attempt_count, result)) = publishes.next().await {
+            match result {
+                Ok(()) => completed.push(id),
+                Err(error) => {
+                    let retry_seconds = 1_i64 << attempt_count.clamp(1, 8);
+                    tracing::error!(outbox_id = id, attempt_count, retry_seconds, %error, "outbox publish failed; scheduled retry");
+                    failed_ids.push(id);
+                    attempts.push(attempt_count);
+                    delays.push(retry_seconds);
+                    errors.push(error.to_string());
+                }
+            }
+        }
+        if !completed.is_empty() {
+            sqlx::query(
+                "UPDATE outbox SET processed_at = now(), last_error = NULL WHERE id = ANY($1)",
+            )
+            .bind(&completed)
+            .execute(&mut *tx)
+            .await?;
+        }
+        if !failed_ids.is_empty() {
+            sqlx::query(
+                "UPDATE outbox AS o SET attempt_count = f.attempt, next_attempt_at = now() + (f.delay * interval '1 second'), last_error = f.error \
+                 FROM UNNEST($1::bigint[], $2::integer[], $3::bigint[], $4::text[]) AS f(id, attempt, delay, error) WHERE o.id = f.id"
+            ).bind(&failed_ids).bind(&attempts).bind(&delays).bind(&errors)
+                .execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::Resources;
+
+    #[test]
+    fn restores_legacy_payload_without_changing_json_objects() {
+        let object = serde_json::json!({"id": 1});
+        let bytes = serde_json::to_value(serde_json::to_vec(&object).unwrap()).unwrap();
+        assert_eq!(restore_outbox_payload(bytes), object);
+        assert_eq!(restore_outbox_payload(object.clone()), object);
+        let array = serde_json::json!(["normal", "array"]);
+        assert_eq!(restore_outbox_payload(array.clone()), array);
+    }
+
+    async fn seed(r: &Resources, aggregates: &[&str]) {
+        let mut tx = r.pool.begin().await.unwrap();
+        r.store
+            .create_outbox_records(
+                &mut tx,
+                aggregates
+                    .iter()
+                    .enumerate()
+                    .map(|(n, aggregate)| OutboxRecord {
+                        event_id: uuid::Uuid::now_v7(),
+                        aggregate_type: "test".into(),
+                        aggregate_id: (*aggregate).into(),
+                        event_type: "test".into(),
+                        exchange: r.schema.clone(),
+                        payload: serde_json::json!({"n": n}),
+                    }),
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL and RabbitMQ; set DATABASE_URL and AMQP_URL"]
+    async fn batches_independent_aggregates_and_does_not_overtake_locked_heads() {
+        let r = Resources::new().await;
+        seed(&r, &["a", "a", "b", "c"]).await;
+        let mut lock = r.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM outbox WHERE id = 1 FOR UPDATE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        assert!(r.store.process_next_outbox(&r.broker).await.unwrap());
+        let ids: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM outbox WHERE processed_at IS NOT NULL ORDER BY id")
+                .fetch_all(&r.pool)
+                .await
+                .unwrap();
+        assert_eq!(ids, vec![3, 4]);
+        assert!(!r.store.process_next_outbox(&r.broker).await.unwrap());
+        lock.rollback().await.unwrap();
+        // Competing workers cannot publish the same head concurrently.
+        let (a, b) = tokio::join!(
+            r.store.process_next_outbox(&r.broker),
+            r.store.process_next_outbox(&r.broker)
+        );
+        a.unwrap();
+        b.unwrap();
+        while r.store.process_next_outbox(&r.broker).await.unwrap() {}
+        let queue = r
+            .channel
+            .queue_declare(
+                r.schema.clone().into(),
+                lapin::options::QueueDeclareOptions::durable(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queue.message_count(), 4);
+        let mut delivered = Vec::new();
+        for _ in 0..4 {
+            let message = r
+                .channel
+                .basic_get(
+                    r.schema.clone().into(),
+                    lapin::options::BasicGetOptions { no_ack: true },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            delivered.push(
+                serde_json::from_slice::<Value>(&message.delivery.data).unwrap()["n"]
+                    .as_u64()
+                    .unwrap(),
+            );
+        }
+        assert!(delivered.iter().position(|n| *n == 0) < delivered.iter().position(|n| *n == 1));
+        r.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL and RabbitMQ; set DATABASE_URL and AMQP_URL"]
+    async fn unroutable_head_retries_without_blocking_other_aggregates() {
+        let r = Resources::new().await;
+        seed(&r, &["a", "a", "b"]).await;
+        let missing = format!("{}_unrouted", r.schema);
+        sqlx::query("UPDATE outbox SET exchange = $1 WHERE id = 1")
+            .bind(&missing)
+            .execute(&r.pool)
+            .await
+            .unwrap();
+        assert!(r.store.process_next_outbox(&r.broker).await.unwrap());
+        let states: Vec<(i64, i32, bool)> = sqlx::query_as(
+            "SELECT id, attempt_count, processed_at IS NOT NULL FROM outbox ORDER BY id",
+        )
+        .fetch_all(&r.pool)
+        .await
+        .unwrap();
+        assert_eq!(states, vec![(1, 1, false), (2, 0, false), (3, 0, true)]);
+        assert!(!r.store.process_next_outbox(&r.broker).await.unwrap());
+        sqlx::query("UPDATE outbox SET exchange = $1, next_attempt_at = now() WHERE id = 1")
+            .bind(&r.schema)
+            .execute(&r.pool)
+            .await
+            .unwrap();
+        assert!(r.store.process_next_outbox(&r.broker).await.unwrap());
+        assert!(r.store.process_next_outbox(&r.broker).await.unwrap());
+        assert!(!r.store.process_next_outbox(&r.broker).await.unwrap());
+        r.channel
+            .exchange_delete(missing.into(), Default::default())
+            .await
+            .unwrap();
+        r.cleanup().await;
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL and RabbitMQ; set DATABASE_URL and AMQP_URL"]
+    async fn respects_configured_batch_limit_after_empty_outbox_analysis() {
+        let mut r = Resources::new().await;
+        r.store = EventityPg::new(r.pool.clone()).with_outbox_options(OutboxOptions {
+            batch_size: NonZeroU16::new(2).unwrap(),
+            ..Default::default()
+        });
+        seed(&r, &["old"]).await;
+        sqlx::query("UPDATE outbox SET processed_at = now()")
+            .execute(&r.pool)
+            .await
+            .unwrap();
+        sqlx::query("ANALYZE outbox")
+            .execute(&r.pool)
+            .await
+            .unwrap();
+        seed(&r, &["a", "b", "c", "d", "e"]).await;
+        for expected_pending in [3_i64, 1, 0] {
+            assert!(r.store.process_next_outbox(&r.broker).await.unwrap());
+            let pending: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM outbox WHERE processed_at IS NULL")
+                    .fetch_one(&r.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(pending, expected_pending);
+        }
+        assert!(!r.store.process_next_outbox(&r.broker).await.unwrap());
+        r.cleanup().await;
     }
 }

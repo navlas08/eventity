@@ -37,21 +37,35 @@ macro_rules! recover_channel_call {
 ///
 /// Connections enable Lapin's automatic recovery. Exchanges, queues, bindings,
 /// and consumers are declared by registered event subscriptions and replayed
-/// by Lapin after a recoverable connection failure. The connection is shared by
-/// all bus workers; create one instance and pass it to the builder.
+/// by Lapin after a recoverable connection failure. Publishing uses a separate
+/// connection so broker flow control cannot block consumer acknowledgements.
+/// Create one instance and share it with the bus builder.
 pub struct RabbitMQ {
     connection: Connection,
+    publishing_connection: Connection,
+    publisher: tokio::sync::Mutex<Option<Publisher>>,
+}
+
+struct Publisher {
+    channel: Channel,
+    exchanges: HashSet<ShortString>,
 }
 
 impl RabbitMQ {
-    /// Opens a RabbitMQ connection and enables Lapin automatic recovery.
+    /// Opens consumer and publisher connections with Lapin automatic recovery.
     ///
-    /// The initial connection attempt times out after 15 seconds. A later
+    /// Each initial connection attempt times out after 15 seconds. A later
     /// recoverable disconnect is handled by Lapin's Reconnect and topology
     /// recovery mechanism.
     pub async fn new(connection_string: impl AsRef<str>) -> Result<Self, EventityError> {
         let connection = Self::connect(connection_string.as_ref()).await?;
-        Ok(Self { connection })
+        // Broker flow control on publishing must not block consumer acks.
+        let publishing_connection = Self::connect(connection_string.as_ref()).await?;
+        Ok(Self {
+            connection,
+            publishing_connection,
+            publisher: tokio::sync::Mutex::new(None),
+        })
     }
 
     async fn connect(uri: &str) -> Result<Connection, EventityError> {
@@ -176,20 +190,7 @@ impl RabbitMQ {
     }
     pub(crate) async fn publish(&self, message: Message) -> Result<(), EventityError> {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            let channel = self.create_channel().await?;
-            recover_channel_call!(
-                channel,
-                channel.exchange_declare(
-                    message.exchange_name.clone(),
-                    ExchangeKind::Fanout,
-                    ExchangeDeclareOptions::default(),
-                    FieldTable::default(),
-                )
-            )?;
-            recover_channel_call!(
-                channel,
-                channel.confirm_select(ConfirmSelectOptions::default())
-            )?;
+            let channel = self.publisher_channel(&message.exchange_name).await?;
             let confirmation = recover_channel_call!(
                 channel,
                 channel.basic_publish(
@@ -222,6 +223,43 @@ impl RabbitMQ {
         .await
         .map_err(|_| EventityError::PublishTimeout)?
     }
+
+    // Serialize initialization only. Publishing and waiting for confirms must
+    // happen outside this lock so that confirms can be pipelined.
+    async fn publisher_channel(&self, exchange: &ShortString) -> Result<Channel, EventityError> {
+        let mut publisher = self.publisher.lock().await;
+        if publisher
+            .as_ref()
+            .is_some_and(|p| !p.channel.status().connected() && !p.channel.status().reconnecting())
+        {
+            *publisher = None;
+        }
+        if publisher.is_none() {
+            let channel = self.publishing_connection.create_channel().await?;
+            recover_channel_call!(
+                channel,
+                channel.confirm_select(ConfirmSelectOptions::default())
+            )?;
+            *publisher = Some(Publisher {
+                channel,
+                exchanges: HashSet::new(),
+            });
+        }
+        let publisher = publisher.as_mut().expect("publisher initialized above");
+        if !publisher.exchanges.contains(exchange) {
+            recover_channel_call!(
+                publisher.channel,
+                publisher.channel.exchange_declare(
+                    exchange.clone(),
+                    ExchangeKind::Fanout,
+                    ExchangeDeclareOptions::default(),
+                    FieldTable::default()
+                )
+            )?;
+            publisher.exchanges.insert(exchange.clone());
+        }
+        Ok(publisher.channel.clone())
+    }
 }
 
 pub(crate) struct Message {
@@ -234,6 +272,24 @@ pub(crate) struct Message {
 pub struct NoBroker;
 /// Typestate marker used until a PostgreSQL store is attached to the builder.
 pub struct NoStore;
+
+/// Independent limits for handler execution and broker delivery buffering.
+#[derive(Clone, Copy, Debug)]
+pub struct ConsumerOptions {
+    /// Maximum number of handler tasks executing concurrently.
+    pub concurrency: std::num::NonZeroU16,
+    /// Maximum unacknowledged broker deliveries. Values above concurrency
+    /// buffer deliveries while handlers run and hide broker round-trip latency.
+    pub prefetch: std::num::NonZeroU16,
+}
+impl Default for ConsumerOptions {
+    fn default() -> Self {
+        Self {
+            concurrency: std::num::NonZeroU16::MIN,
+            prefetch: std::num::NonZeroU16::MIN,
+        }
+    }
+}
 
 /// Configures a message bus before starting its background workers.
 ///
@@ -321,9 +377,26 @@ impl<B, S> MessageBusBuilder<B, S> {
     /// prefetch count, so the broker does not send more unacknowledged messages
     /// than this worker can process concurrently.
     pub fn event_handler_with_concurrency<E: IntegrationEvent, H: EventHandler<E>>(
-        mut self,
+        self,
         handler: H,
         concurrency: std::num::NonZeroU16,
+    ) -> Self {
+        self.event_handler_with_options::<E, H>(
+            handler,
+            ConsumerOptions {
+                concurrency,
+                prefetch: concurrency,
+            },
+        )
+    }
+    /// Registers a handler with independent execution and prefetch limits.
+    /// Concurrent handlers may complete out of order; use concurrency one
+    /// when processing order is required. Prefetch below concurrency limits
+    /// the effective parallelism to the prefetch value.
+    pub fn event_handler_with_options<E: IntegrationEvent, H: EventHandler<E>>(
+        mut self,
+        handler: H,
+        options: ConsumerOptions,
     ) -> Self {
         if !self.event_queues.insert(E::queue()) {
             self.configuration_error = Some(EventityError::DuplicateEventQueue(E::queue()));
@@ -331,7 +404,7 @@ impl<B, S> MessageBusBuilder<B, S> {
         }
         self.subscriptions.push(Box::new(EventSubscription::<E, H> {
             handler: Arc::new(handler),
-            concurrency,
+            options,
             _event: std::marker::PhantomData,
         }));
         self
@@ -396,7 +469,7 @@ trait Subscription: Send + Sync {
 }
 struct EventSubscription<E, H> {
     handler: Arc<H>,
-    concurrency: std::num::NonZeroU16,
+    options: ConsumerOptions,
     _event: std::marker::PhantomData<fn(E)>,
 }
 #[async_trait]
@@ -411,8 +484,9 @@ where
         store: Arc<EventityPg>,
         cancel: CancellationToken,
     ) -> Result<JoinHandle<Result<(), EventityError>>, EventityError> {
-        let concurrency = self.concurrency.get();
-        let consumer = prepare_consumer_with_timeout::<E>(&broker, concurrency).await?;
+        let concurrency = self.options.concurrency.get();
+        let prefetch = self.options.prefetch.get();
+        let consumer = prepare_consumer_with_timeout::<E>(&broker, prefetch).await?;
         let handler = self.handler.clone();
         Ok(tokio::spawn(async move {
             let mut consumer = Some(consumer);
@@ -421,8 +495,23 @@ where
                 if cancel.is_cancelled() {
                     return Ok(());
                 }
-                let Some((current_consumer, channel)) = consumer.take() else {
-                    return Err(EventityError::Worker("consumer was not initialized".into()));
+                let (current_consumer, channel) = match consumer.take() {
+                    Some(current) => current,
+                    None => match tokio::select! {
+                        _ = cancel.cancelled() => return Ok(()),
+                        result = prepare_consumer_with_timeout::<E>(&broker, prefetch) => result,
+                    } {
+                        Ok(next) => next,
+                        Err(error) => {
+                            tracing::error!(%error, ?retry_delay, "could not reconnect event consumer");
+                            tokio::select! {
+                                _ = cancel.cancelled() => return Ok(()),
+                                _ = tokio::time::sleep(retry_delay) => {},
+                            }
+                            retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(30));
+                            continue;
+                        }
+                    },
                 };
                 match run_consumer::<E, H>(
                     current_consumer,
@@ -443,16 +532,6 @@ where
                 tokio::select! {
                     _ = cancel.cancelled() => return Ok(()),
                     _ = tokio::time::sleep(retry_delay) => {}
-                }
-                match prepare_consumer_with_timeout::<E>(&broker, concurrency).await {
-                    Ok(next) => {
-                        consumer = Some(next);
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, ?retry_delay, "could not reconnect event consumer");
-                        retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(30));
-                        continue;
-                    }
                 }
             }
         }))
@@ -488,6 +567,34 @@ async fn prepare_consumer_with_timeout<E: IntegrationEvent>(
 }
 
 async fn run_consumer<E, H>(
+    consumer: Consumer,
+    channel: Channel,
+    store: Arc<EventityPg>,
+    handler: Arc<H>,
+    cancel: CancellationToken,
+    limit: usize,
+) -> Result<(), EventityError>
+where
+    E: IntegrationEvent,
+    H: EventHandler<E>,
+{
+    let result =
+        run_consumer_deliveries::<E, H>(consumer, channel.clone(), store, handler, cancel, limit)
+            .await;
+    // Closing also requeues deliveries that were prefetched but never started.
+    // Do this on errors as well as shutdown so abandoned consumers cannot retain
+    // unacknowledged messages on a connection shared with other subscriptions.
+    let close = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        channel.close(200, "consumer stopped".into()),
+    )
+    .await;
+    result?;
+    close.map_err(|_| EventityError::Worker("timed out closing consumer channel".into()))??;
+    Ok(())
+}
+
+async fn run_consumer_deliveries<E, H>(
     mut consumer: Consumer,
     channel: Channel,
     store: Arc<EventityPg>,
@@ -500,31 +607,31 @@ where
     H: EventHandler<E>,
 {
     let mut tasks = JoinSet::new();
-    let concurrency = Arc::new(tokio::sync::Semaphore::new(limit));
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
-            delivery = consumer.next() => match delivery {
+            delivery = consumer.next(), if tasks.len() < limit => match delivery {
                 Some(Ok(delivery)) => {
-                    let (store, handler, cancel, concurrency) =
-                        (store.clone(), handler.clone(), cancel.clone(), concurrency.clone());
+                    let (store, handler) = (store.clone(), handler.clone());
                     tasks.spawn(async move {
-                        let concurrency_permit = tokio::select! {
-                            _ = cancel.cancelled() => return Ok(()),
-                            permit = concurrency.acquire_owned() => permit.map_err(|_| EventityError::Worker("concurrency limiter closed".into()))?,
-                        };
-                        let _concurrency_permit = concurrency_permit;
                         match process_delivery::<E, H>(&store, &handler, &delivery).await {
                             Ok(()) => delivery.ack(BasicAckOptions::default()).await.map(|_| ()).map_err(EventityError::from),
                             Err(error) => {
-                                delivery.nack(BasicNackOptions { requeue: false, ..Default::default() }).await?;
-                                tracing::error!(%error, "event processing failed; message moved to the dead-letter queue");
+                                let requeue = matches!(error, EventityError::Postgres(_));
+                                if requeue {
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                }
+                                delivery.nack(BasicNackOptions { requeue, ..Default::default() }).await?;
+                                tracing::error!(%error, requeue, "event processing failed");
                                 Ok(())
                             }
                         }
                     });
                 }
-                Some(Err(error)) => match channel.wait_for_recovery(error).await {
+                Some(Err(error)) => match tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    result = channel.wait_for_recovery(error) => result,
+                } {
                     Ok(()) => continue,
                     Err(error) => return Err(error.into()),
                 },
@@ -535,6 +642,15 @@ where
             }
         }
     }
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        channel.basic_cancel(
+            consumer.tag(),
+            lapin::options::BasicCancelOptions::default(),
+        ),
+    )
+    .await
+    .map_err(|_| EventityError::Worker("timed out cancelling consumer".into()))??;
     while let Some(result) = tasks.join_next().await {
         result.map_err(|error| EventityError::Join(error.to_string()))??;
     }
@@ -555,7 +671,7 @@ where
     let event_id = match delivery.properties.message_id() {
         Some(id) => uuid::Uuid::from_str(id.as_str())
             .map_err(|error| EventityError::InvalidMessageId(error.to_string()))?,
-        None => uuid::Uuid::now_v7(),
+        None => return Err(EventityError::MissingMessageId),
     };
     let mut tx = store.get_transaction().await?;
     let inserted = store
@@ -574,12 +690,15 @@ where
         return Ok(());
     }
     let outgoing = handler
-        .handle(event)
+        .handle_transactional(event, &mut tx)
         .await
         .map_err(|error| EventityError::Handler(format!("{error:?}")))?;
     let records = outgoing.into_records()?;
-    store.create_outbox_records(&mut tx, records).await?;
+    let inserted = store.create_outbox_records(&mut tx, records).await?;
     tx.commit().await?;
+    if inserted > 0 {
+        store.notify_outbox();
+    }
     Ok(())
 }
 
@@ -618,7 +737,8 @@ impl MessageBus {
             .into_records()
             .map_err(EventityError::from)
             .map_err(InvokeError::Bus)?;
-        self.store
+        let inserted = self
+            .store
             .create_outbox_records(&mut tx, records)
             .await
             .map_err(EventityError::from)
@@ -627,6 +747,9 @@ impl MessageBus {
             .await
             .map_err(EventityError::from)
             .map_err(InvokeError::Bus)?;
+        if inserted > 0 {
+            self.store.notify_outbox();
+        }
         Ok(output)
     }
     /// Starts a builder for a new message bus.
@@ -722,5 +845,226 @@ async fn join_workers(
 impl Drop for RunningBus {
     fn drop(&mut self) {
         self.cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::Resources;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize)]
+    struct TestEvent {
+        id: u64,
+        fail: bool,
+    }
+    impl IntegrationEvent for TestEvent {
+        type Error = String;
+        fn queue() -> &'static str {
+            "test-consumer"
+        }
+        fn exchange() -> &'static str {
+            "unused"
+        }
+        fn aggregate() -> &'static str {
+            "test"
+        }
+        fn aggregate_id(&self) -> String {
+            self.id.to_string()
+        }
+    }
+    struct TransactionalHandler;
+    #[async_trait]
+    impl EventHandler<TestEvent> for TransactionalHandler {
+        async fn handle(&self, _: TestEvent) -> crate::EHandlerResult<String> {
+            panic!("transactional hook should be called")
+        }
+        async fn handle_transactional(
+            &self,
+            event: TestEvent,
+            tx: &mut sqlx::PgTransaction<'_>,
+        ) -> crate::EHandlerResult<String> {
+            sqlx::query("INSERT INTO effects (id) VALUES ($1)")
+                .bind(event.id as i64)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| e.to_string())?;
+            if event.fail {
+                return Err("rollback".into());
+            }
+            Ok(crate::OutgoingMessages::none())
+        }
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL and RabbitMQ; set DATABASE_URL and AMQP_URL"]
+    async fn inbox_deduplicates_and_rolls_back_application_changes() {
+        let r = Resources::new().await;
+        sqlx::query("CREATE TABLE effects (id bigint)")
+            .execute(&r.pool)
+            .await
+            .unwrap();
+        for fail in [false, true] {
+            r.broker
+                .publish(Message {
+                    event_id: uuid::Uuid::now_v7(),
+                    exchange_name: r.schema.clone().into(),
+                    payload: serde_json::json!({"id": 1, "fail": fail}),
+                })
+                .await
+                .unwrap();
+            let message = r
+                .channel
+                .basic_get(
+                    r.schema.clone().into(),
+                    lapin::options::BasicGetOptions { no_ack: true },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            for _ in 0..2 {
+                let result = process_delivery::<TestEvent, _>(
+                    &r.store,
+                    &TransactionalHandler,
+                    &message.delivery,
+                )
+                .await;
+                assert_eq!(result.is_err(), fail);
+            }
+        }
+        let effects: i64 = sqlx::query_scalar("SELECT count(*) FROM effects")
+            .fetch_one(&r.pool)
+            .await
+            .unwrap();
+        let inbox: i64 = sqlx::query_scalar("SELECT count(*) FROM inbox")
+            .fetch_one(&r.pool)
+            .await
+            .unwrap();
+        assert_eq!((effects, inbox), (1, 1));
+        r.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL and RabbitMQ; set DATABASE_URL and AMQP_URL"]
+    async fn publisher_reuses_channel_and_replaces_closed_channel() {
+        let r = Resources::new().await;
+        let exchange: ShortString = r.schema.clone().into();
+        let first = r.broker.publisher_channel(&exchange).await.unwrap();
+        let next = r.broker.publisher_channel(&exchange).await.unwrap();
+        assert_eq!(first.id(), next.id());
+        assert!(first.status().confirm());
+        first
+            .close(200, "test channel replacement".into())
+            .await
+            .unwrap();
+        r.broker
+            .publish(Message {
+                event_id: uuid::Uuid::now_v7(),
+                exchange_name: exchange,
+                payload: serde_json::json!({"ok": true}),
+            })
+            .await
+            .unwrap();
+        let message = r
+            .channel
+            .basic_get(
+                r.schema.clone().into(),
+                lapin::options::BasicGetOptions { no_ack: true },
+            )
+            .await
+            .unwrap();
+        assert!(message.is_some());
+        r.cleanup().await;
+    }
+    struct BlockingHandler {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl EventHandler<TestEvent> for BlockingHandler {
+        async fn handle(&self, _: TestEvent) -> crate::EHandlerResult<String> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(crate::OutgoingMessages::none())
+        }
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL and RabbitMQ; set DATABASE_URL and AMQP_URL"]
+    async fn shutdown_drains_handler_and_requeues_prefetched_deliveries() {
+        let r = Resources::new().await;
+        for id in 0..8 {
+            r.broker
+                .publish(Message {
+                    event_id: uuid::Uuid::now_v7(),
+                    exchange_name: r.schema.clone().into(),
+                    payload: serde_json::json!({"id": id, "fail": false}),
+                })
+                .await
+                .unwrap();
+        }
+        let (consumer, channel) = r
+            .broker
+            .declare_consumer(r.schema.clone().into(), 8)
+            .await
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handler = Arc::new(BlockingHandler {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(run_consumer::<TestEvent, _>(
+            consumer,
+            channel,
+            Arc::new(EventityPg::new(r.pool.clone())),
+            handler,
+            cancel.clone(),
+            1,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        cancel.cancel();
+        // Give the worker a chance to cancel its subscription before releasing
+        // the active handler; prefetched deliveries must stay unprocessed.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let inbox: i64 = sqlx::query_scalar("SELECT count(*) FROM inbox")
+            .fetch_one(&r.pool)
+            .await
+            .unwrap();
+        assert_eq!(inbox, 1);
+        let queue = r
+            .channel
+            .queue_declare(
+                r.schema.clone().into(),
+                lapin::options::QueueDeclareOptions::durable(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queue.message_count(), 7);
+        let mut message = r
+            .channel
+            .basic_get(
+                r.schema.clone().into(),
+                lapin::options::BasicGetOptions { no_ack: true },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        message.delivery.properties = BasicProperties::default();
+        assert!(matches!(
+            process_delivery::<TestEvent, _>(&r.store, &TransactionalHandler, &message.delivery)
+                .await,
+            Err(EventityError::MissingMessageId)
+        ));
+        r.cleanup().await;
     }
 }

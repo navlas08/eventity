@@ -16,6 +16,9 @@ pub enum EventityError {
     /// A delivery had a non-UUID RabbitMQ `message_id` property.
     #[error("RabbitMQ message_id is not a valid UUID: {0}")]
     InvalidMessageId(String),
+    /// A delivery had no stable identifier for inbox deduplication.
+    #[error("RabbitMQ message_id is required for inbox deduplication")]
+    MissingMessageId,
     /// RabbitMQ did not confirm a publish before the publish timeout.
     #[error("timed out waiting for RabbitMQ publisher confirmation")]
     PublishTimeout,

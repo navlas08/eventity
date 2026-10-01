@@ -23,6 +23,9 @@ struct RequestArgs {
 ///
 /// Provide both associated types with the `request` helper attribute:
 /// ```rust
+/// # use eventity_macro::Request;
+/// # trait Request { type Output; type Error; }
+/// # type MyError = std::convert::Infallible;
 /// #[derive(Request)]
 /// #[request(output = u32, error = MyError)]
 /// struct GetCount;

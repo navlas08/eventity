@@ -55,8 +55,11 @@ pub use request::Request;
 pub use request::RequestHandler;
 
 pub use bus::RabbitMQ;
-pub use bus::{InvokeError, MessageBus, MessageBusBuilder, RunningBus};
+pub use bus::{ConsumerOptions, InvokeError, MessageBus, MessageBusBuilder, RunningBus};
 
 pub use event::OutgoingMessages;
 
-pub use postgres::EventityPg;
+pub use postgres::{EventityPg, OutboxOptions};
+
+#[cfg(test)]
+mod test_support;

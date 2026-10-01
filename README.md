@@ -3,8 +3,7 @@
 Rust-like MediatR or Wolverine.NET PostgreSQL, RabbitMQ and transactional outbox/inbox pattern.
 
 ```toml
-[dependencies]
-eventity = "0.1"
+cargo add eventity
 ```
 
 ```rust,ignore

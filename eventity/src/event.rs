@@ -121,4 +121,15 @@ pub type EHandlerResult<Error> = Result<OutgoingMessages, Error>;
 pub trait EventHandler<IE: IntegrationEvent>: Send + Sync + 'static {
     /// Handles one decoded event and returns any events to emit.
     async fn handle(&self, event: IE) -> EHandlerResult<IE::Error>;
+
+    /// Handles an event using the inbox/outbox transaction. Override this method
+    /// to commit application database changes atomically with deduplication.
+    /// The default delegates to [`Self::handle`] for existing handlers.
+    async fn handle_transactional(
+        &self,
+        event: IE,
+        _tx: &mut sqlx::PgTransaction<'_>,
+    ) -> EHandlerResult<IE::Error> {
+        self.handle(event).await
+    }
 }

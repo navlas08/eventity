@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 description = "Derive macros for the Eventity request and event library"
 license = "MIT"
-license-file = "LICENSE"
 repository = "https://github.com/navlas08/eventity"
 keywords = ["events", "derive", "proc-macro"]
 categories = ["asynchronous", "development-tools::procedural-macro-helpers"]
